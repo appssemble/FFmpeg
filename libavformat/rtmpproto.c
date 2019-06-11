@@ -3058,8 +3058,7 @@ static int rtmp_write(URLContext *s, const uint8_t *buf, int size)
     /* set stream into nonblocking mode */
     rt->stream->flags |= AVIO_FLAG_NONBLOCK;
 
-    /* try to read one byte from the stream */
-    ret = ffurl_read(rt->stream, &c, 1);
+    ret = AVERROR(EAGAIN);
 
     /* switch the stream back into blocking mode */
     rt->stream->flags &= ~AVIO_FLAG_NONBLOCK;
