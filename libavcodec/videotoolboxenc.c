@@ -51,7 +51,12 @@ static struct{
     CFStringRef kCVImageBufferColorPrimaries_ITU_R_2020;
     CFStringRef kCVImageBufferTransferFunction_ITU_R_2020;
     CFStringRef kCVImageBufferYCbCrMatrix_ITU_R_2020;
-
+    
+    CFStringRef kVTCompressionPropertyKey_PixelTransferProperties;
+    CFStringRef kVTPixelTransferPropertyKey_ScalingMode;
+    CFStringRef kVTScalingMode_Letterbox;
+    CFStringRef kVTScalingMode_Trim;
+    
     CFStringRef kVTCompressionPropertyKey_H264EntropyMode;
     CFStringRef kVTH264EntropyMode_CAVLC;
     CFStringRef kVTH264EntropyMode_CABAC;
@@ -108,7 +113,12 @@ static void loadVTEncSymbols(){
     GET_SYM(kCVImageBufferColorPrimaries_ITU_R_2020,   "ITU_R_2020");
     GET_SYM(kCVImageBufferTransferFunction_ITU_R_2020, "ITU_R_2020");
     GET_SYM(kCVImageBufferYCbCrMatrix_ITU_R_2020,      "ITU_R_2020");
-
+    
+    GET_SYM(kVTCompressionPropertyKey_PixelTransferProperties, "PixelTransferProperties");
+    GET_SYM(kVTPixelTransferPropertyKey_ScalingMode, "ScalingMode");
+    GET_SYM(kVTScalingMode_Letterbox, "Letterbox");
+    GET_SYM(kVTScalingMode_Trim, "Trim");
+    
     GET_SYM(kVTCompressionPropertyKey_H264EntropyMode, "H264EntropyMode");
     GET_SYM(kVTH264EntropyMode_CAVLC, "CAVLC");
     GET_SYM(kVTH264EntropyMode_CABAC, "CABAC");
@@ -767,6 +777,8 @@ static int get_cv_pixel_format(AVCodecContext* avctx,
                                         kCVPixelFormatType_420YpCbCr10BiPlanarFullRange :
                                         kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
         *av_pixel_format = kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange;
+    } else if (fmt == AV_PIX_FMT_RGBA) {
+        *av_pixel_format = kCVPixelFormatType_32ARGB;
     } else {
         return AVERROR(EINVAL);
     }
@@ -966,6 +978,10 @@ static int get_cv_ycbcr_matrix(AVCodecContext *avctx, CFStringRef *matrix) {
     return 0;
 }
 
+
+static int pool_width;
+static int pool_height;
+
 static int vtenc_create_encoder(AVCodecContext   *avctx,
                                 CMVideoCodecType codec_type,
                                 CFStringRef      profile_level,
@@ -985,9 +1001,11 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
     int64_t      one_second_value = 0;
     void         *nums[2];
 
+    pool_width = avctx->width;
+    pool_height = avctx->height;
     int status = VTCompressionSessionCreate(kCFAllocatorDefault,
-                                            avctx->width,
-                                            avctx->height,
+                                            avctx->coded_width,
+                                            avctx->coded_height,
                                             codec_type,
                                             enc_info,
                                             pixel_buffer_info,
@@ -1259,6 +1277,28 @@ static int vtenc_create_encoder(AVCodecContext   *avctx,
 
         if (status) {
             av_log(avctx, AV_LOG_ERROR, "Error setting realtime property: %d\n", status);
+        }
+    }
+    
+    if (avctx->apply_cropping) {
+        const void *keys[] =   { compat_keys.kVTPixelTransferPropertyKey_ScalingMode };
+        const void *values[] = { compat_keys.kVTScalingMode_Trim };
+        
+        CFDictionaryRef dict = CFDictionaryCreate(NULL, keys, values, 1, NULL, NULL);
+        status = VTSessionSetProperty(vtctx->session, compat_keys.kVTCompressionPropertyKey_PixelTransferProperties, dict);
+        
+        if (status) {
+            av_log(avctx, AV_LOG_ERROR, "Error setting pixel transfer: %d\n", status);
+        }
+    } else {
+        const void *keys[] =   { compat_keys.kVTPixelTransferPropertyKey_ScalingMode };
+        const void *values[] = { compat_keys.kVTScalingMode_Letterbox };
+        
+        CFDictionaryRef dict = CFDictionaryCreate(NULL, keys, values, 1, NULL, NULL);
+        status = VTSessionSetProperty(vtctx->session, compat_keys.kVTCompressionPropertyKey_PixelTransferProperties, dict);
+        
+        if (status) {
+            av_log(avctx, AV_LOG_ERROR, "Error setting pixel transfer: %d\n", status);
         }
     }
 
@@ -1961,7 +2001,7 @@ static int get_cv_pixel_info(
                    av_get_pix_fmt_name(av_format));
         }
     }
-
+    
     switch (av_format) {
     case AV_PIX_FMT_NV12:
         *plane_count = 2;
@@ -1989,6 +2029,14 @@ static int get_cv_pixel_info(
         widths [2] = (avctx->width  + 1) / 2;
         heights[2] = (avctx->height + 1) / 2;
         strides[2] = frame ? frame->linesize[2] : (avctx->width + 1) / 2;
+        break;
+            
+    case AV_PIX_FMT_RGBA:
+        *plane_count = 1;
+        
+        widths [0] = avctx->width;
+        heights[0] = avctx->height;
+        strides[0] = frame ? frame->linesize[0] : avctx->width;
         break;
 
     case AV_PIX_FMT_P010LE:
@@ -2302,6 +2350,13 @@ static av_cold int vtenc_frame(
     ExtraSEI *sei = NULL;
 
     if (frame) {
+        
+        if ((frame->width != pool_width) || (frame->height != pool_height)) {
+            CFRelease(vtctx->session);
+            vtctx->session = NULL;
+            status = vtenc_configure_encoder(avctx);
+        }
+        
         status = vtenc_send_frame(avctx, vtctx, frame);
 
         if (status) {
